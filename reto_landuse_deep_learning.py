@@ -11,14 +11,18 @@ LandUseCNN.ipynb a Python normal (.py), y completa el reto solicitado:
 5) Metricas matematicas y graficas para comparar resultados.
 6) Evidencias guardadas en carpeta de salida.
 
+Uso local rapido, desde esta carpeta:
+    python reto_landuse_deep_learning.py
+
+Uso completo para entrega/comparacion final:
+    python reto_landuse_deep_learning.py --no-fast --deep-models cnn resnet
+
 Uso recomendado en Colab:
     python reto_landuse_deep_learning.py \
         --base-path "/content/drive/MyDrive/2025/Docencia/Visión con IA/4. Aprendizaje Profundo/Ejemplos" \
         --folder landuse \
-        --epochs 30
-
-Uso local:
-    python reto_landuse_deep_learning.py --base-path "/ruta/a/Ejemplos" --folder landuse
+        --no-fast \
+        --deep-models cnn resnet
 
 La estructura esperada es:
 base_path/landuse/buildings/*.png
@@ -47,7 +51,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelBinarizer, LabelEncoder
-from tensorflow.keras import Model, layers, regularizers
+from tensorflow.keras import Model, layers, regularizers, mixed_precision
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -56,6 +60,23 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 DEFAULT_CLASSES = ["buildings", "airplane", "tenniscourt"]
 IMG_SIZE = 128
 SEED = 42
+
+
+def configure_tensorflow() -> None:
+    """Configura GPU si existe. En CPU evita usar mixed precision porque suele ser mas lento."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        print("TensorFlow: no se detecto GPU. Se entrenara en CPU.")
+        return
+
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError:
+            pass
+
+    mixed_precision.set_global_policy("mixed_float16")
+    print(f"TensorFlow: GPU detectada ({len(gpus)}). Mixed precision activado.")
 
 
 def set_seed(seed: int = SEED) -> None:
@@ -78,7 +99,13 @@ def make_output_dirs(output_dir: str) -> dict:
     return dirs
 
 
-def load_landuse_images(base_path: str, folder: str, classes: list[str], img_size: int = IMG_SIZE):
+def load_landuse_images(
+    base_path: str,
+    folder: str,
+    classes: list[str],
+    img_size: int = IMG_SIZE,
+    max_images_per_class: int | None = None,
+):
     """Carga imagenes como en LandUseCNN.ipynb: BGR->RGB, resize, normalizacion 0..1."""
     dataset_dir = Path(base_path) / folder
     data, labels, paths = [], [], []
@@ -91,6 +118,8 @@ def load_landuse_images(base_path: str, folder: str, classes: list[str], img_siz
         image_files = sorted(
             [p for p in class_dir.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg", ".tif", ".tiff"]]
         )
+        if max_images_per_class is not None:
+            image_files = image_files[:max_images_per_class]
         print(f"Cargando {class_name}: {len(image_files)} imagenes")
 
         for path in image_files:
@@ -179,29 +208,38 @@ def train_ml_baseline(train_x, test_x, train_y, test_y, class_names, dirs):
     return model, metrics
 
 
-def build_sequential_cnn(input_shape, num_classes):
+def scaled_filters(base_filters: int, model_scale: float) -> int:
+    return max(8, int(round((base_filters * model_scale) / 8)) * 8)
+
+
+def build_sequential_cnn(input_shape, num_classes, model_scale: float = 1.0):
     """CNN secuencial mejorada a partir de LandUseCNN.ipynb."""
+    f1 = scaled_filters(32, model_scale)
+    f2 = scaled_filters(64, model_scale)
+    f3 = scaled_filters(128, model_scale)
+    dense_units = scaled_filters(256, model_scale)
+
     model = tf.keras.Sequential(
         [
             layers.Input(shape=input_shape),
-            layers.Conv2D(32, 3, padding="same", activation="relu"),
+            layers.Conv2D(f1, 3, padding="same", activation="relu"),
             layers.BatchNormalization(),
-            layers.Conv2D(32, 3, padding="same", activation="relu"),
+            layers.Conv2D(f1, 3, padding="same", activation="relu"),
             layers.MaxPooling2D(),
             layers.Dropout(0.20),
-            layers.Conv2D(64, 3, padding="same", activation="relu"),
+            layers.Conv2D(f2, 3, padding="same", activation="relu"),
             layers.BatchNormalization(),
-            layers.Conv2D(64, 3, padding="same", activation="relu"),
+            layers.Conv2D(f2, 3, padding="same", activation="relu"),
             layers.MaxPooling2D(),
             layers.Dropout(0.25),
-            layers.Conv2D(128, 3, padding="same", activation="relu"),
+            layers.Conv2D(f3, 3, padding="same", activation="relu"),
             layers.BatchNormalization(),
             layers.MaxPooling2D(),
             layers.Dropout(0.30),
-            layers.Flatten(),
-            layers.Dense(256, activation="relu", kernel_regularizer=regularizers.l2(1e-4)),
+            layers.GlobalAveragePooling2D(),
+            layers.Dense(dense_units, activation="relu", kernel_regularizer=regularizers.l2(1e-4)),
             layers.Dropout(0.50),
-            layers.Dense(num_classes, activation="softmax"),
+            layers.Dense(num_classes, activation="softmax", dtype="float32"),
         ],
         name="cnn_secuencial_mejorada",
     )
@@ -225,30 +263,48 @@ def residual_block(x, filters, stride=1):
     return x
 
 
-def build_resnet_like(input_shape, num_classes):
+def build_resnet_like(input_shape, num_classes, model_scale: float = 1.0):
     """Arquitectura no secuencial con conexiones residuales tipo ResNet."""
+    f1 = scaled_filters(32, model_scale)
+    f2 = scaled_filters(64, model_scale)
+    f3 = scaled_filters(128, model_scale)
+    dense_units = scaled_filters(128, model_scale)
+
     inputs = layers.Input(shape=input_shape)
-    x = layers.Conv2D(32, 3, padding="same", use_bias=False)(inputs)
+    x = layers.Conv2D(f1, 3, padding="same", use_bias=False)(inputs)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
 
-    x = residual_block(x, 32, stride=1)
+    x = residual_block(x, f1, stride=1)
     x = layers.MaxPooling2D()(x)
     x = layers.Dropout(0.20)(x)
 
-    x = residual_block(x, 64, stride=1)
+    x = residual_block(x, f2, stride=1)
     x = layers.MaxPooling2D()(x)
     x = layers.Dropout(0.25)(x)
 
-    x = residual_block(x, 128, stride=1)
+    x = residual_block(x, f3, stride=1)
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(128, activation="relu", kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.Dense(dense_units, activation="relu", kernel_regularizer=regularizers.l2(1e-4))(x)
     x = layers.Dropout(0.40)(x)
-    outputs = layers.Dense(num_classes, activation="softmax")(x)
+    outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
     return Model(inputs, outputs, name="resnet_ligera_no_secuencial")
 
 
-def compile_and_train(model, train_x, train_y, test_x, test_y, dirs, model_name, epochs, batch_size):
+def compile_and_train(
+    model,
+    train_x,
+    train_y,
+    test_x,
+    test_y,
+    dirs,
+    model_name,
+    epochs,
+    batch_size,
+    augment,
+    early_stop_patience,
+    lr_patience,
+):
     opt = Adam(learning_rate=1e-3)
     model.compile(optimizer=opt, loss="categorical_crossentropy", metrics=["accuracy"])
     model.summary()
@@ -256,26 +312,37 @@ def compile_and_train(model, train_x, train_y, test_x, test_y, dirs, model_name,
     checkpoint_path = dirs["models"] / f"{model_name}.keras"
     callbacks = [
         ModelCheckpoint(str(checkpoint_path), monitor="val_accuracy", save_best_only=True, mode="max"),
-        EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.3, patience=4, min_lr=1e-6),
+        EarlyStopping(monitor="val_loss", patience=early_stop_patience, restore_best_weights=True),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.3, patience=lr_patience, min_lr=1e-6),
     ]
 
-    datagen = ImageDataGenerator(
-        rotation_range=15,
-        width_shift_range=0.08,
-        height_shift_range=0.08,
-        zoom_range=0.12,
-        horizontal_flip=True,
-        fill_mode="nearest",
-    )
-
-    history = model.fit(
-        datagen.flow(train_x, train_y, batch_size=batch_size, shuffle=True),
-        validation_data=(test_x, test_y),
-        epochs=epochs,
-        callbacks=callbacks,
-        verbose=1,
-    )
+    if augment:
+        datagen = ImageDataGenerator(
+            rotation_range=15,
+            width_shift_range=0.08,
+            height_shift_range=0.08,
+            zoom_range=0.12,
+            horizontal_flip=True,
+            fill_mode="nearest",
+        )
+        history = model.fit(
+            datagen.flow(train_x, train_y, batch_size=batch_size, shuffle=True),
+            validation_data=(test_x, test_y),
+            epochs=epochs,
+            callbacks=callbacks,
+            verbose=1,
+        )
+    else:
+        history = model.fit(
+            train_x,
+            train_y,
+            validation_data=(test_x, test_y),
+            epochs=epochs,
+            batch_size=batch_size,
+            shuffle=True,
+            callbacks=callbacks,
+            verbose=1,
+        )
 
     plot_history(history, model_name, dirs["plots"] / f"{model_name}_curvas_entrenamiento.png")
     return model, history
@@ -364,12 +431,20 @@ def plot_metrics_comparison(metrics_list, dirs):
 def write_conclusions(metrics_list, dirs, classes):
     sorted_metrics = sorted(metrics_list, key=lambda m: m["accuracy"], reverse=True)
     best = sorted_metrics[0]
+    deep_model_names = [m["modelo"] for m in metrics_list if m["modelo"] != "01_random_forest_ml"]
+    if deep_model_names:
+        comparison_text = (
+            "Se comparo un modelo clasico Random Forest basado en medias y desviaciones RGB "
+            f"contra {len(deep_model_names)} modelo(s) de aprendizaje profundo: "
+            f"{', '.join(deep_model_names)}.\n"
+        )
+    else:
+        comparison_text = "Se entreno el modelo clasico Random Forest basado en medias y desviaciones RGB.\n"
+
     lines = [
         "CONCLUSIONES DEL RETO LANDUSE\n",
         f"Clases usadas: {', '.join(classes)}.\n",
-        "Se comparo un modelo clasico Random Forest basado en medias y desviaciones RGB "
-        "contra dos modelos de aprendizaje profundo: una CNN secuencial mejorada y una "
-        "arquitectura no secuencial tipo ResNet ligera.\n",
+        comparison_text,
         "Resumen de resultados:\n",
     ]
     for m in metrics_list:
@@ -396,25 +471,86 @@ def write_conclusions(metrics_list, dirs, classes):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Reto LandUse con aprendizaje profundo")
-    parser.add_argument("--base-path", type=str, required=True, help="Ruta base que contiene la carpeta landuse")
+    parser.add_argument("--base-path", type=str, default=".", help="Ruta base que contiene la carpeta landuse")
     parser.add_argument("--folder", type=str, default="landuse", help="Nombre de la carpeta del dataset")
     parser.add_argument("--classes", nargs="+", default=DEFAULT_CLASSES, help="Tres clases/subcarpetas a usar")
     parser.add_argument("--epochs", type=int, default=30, help="Epocas para entrenar cada red")
     parser.add_argument("--batch-size", type=int, default=32, help="Tamano de batch")
+    parser.add_argument("--img-size", type=int, default=IMG_SIZE, help="Tamano de imagen cuadrada usado por las redes")
     parser.add_argument("--output-dir", type=str, default="evidencias_landuse", help="Carpeta para evidencias")
     parser.add_argument("--test-size", type=float, default=0.25, help="Porcentaje para prueba")
+    parser.add_argument(
+        "--deep-models",
+        nargs="+",
+        choices=["cnn", "resnet"],
+        default=None,
+        help="Redes profundas a entrenar. Por defecto: cnn en modo rapido, cnn resnet con --no-fast.",
+    )
+    parser.add_argument(
+        "--model-scale",
+        type=float,
+        default=1.0,
+        help="Escala de filtros de las redes. 1.0 completo, 0.5 mas rapido.",
+    )
+    parser.add_argument(
+        "--augment",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Activa/desactiva aumentacion de datos. En modo rapido se desactiva por defecto.",
+    )
+    parser.add_argument("--early-stop-patience", type=int, default=8, help="Paciencia de EarlyStopping")
+    parser.add_argument("--lr-patience", type=int, default=4, help="Paciencia de ReduceLROnPlateau")
+    parser.add_argument(
+        "--max-images-per-class",
+        type=int,
+        default=None,
+        help="Limita imagenes por clase para pruebas rapidas. No usar en la corrida final.",
+    )
+    parser.add_argument(
+        "--fast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Atajo activado por defecto: menos epocas, imagen mas pequena, batch mayor, red liviana y sin aumentacion.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.deep_models is None:
+        args.deep_models = ["cnn"] if args.fast else ["cnn", "resnet"]
+
+    if args.fast:
+        if args.epochs == 30:
+            args.epochs = 8
+        if args.img_size == IMG_SIZE:
+            args.img_size = 96
+        if args.batch_size == 32:
+            args.batch_size = 64
+        if args.model_scale == 1.0:
+            args.model_scale = 0.5
+        if args.early_stop_patience == 8:
+            args.early_stop_patience = 3
+        if args.lr_patience == 4:
+            args.lr_patience = 2
+
+    if args.augment is None:
+        args.augment = not args.fast
+
     set_seed(SEED)
+    configure_tensorflow()
     dirs = make_output_dirs(args.output_dir)
 
     if len(args.classes) != 3:
         raise ValueError("El reto pide seleccionar 3 tipos de cobertura. Pasa exactamente 3 clases en --classes.")
 
-    images, string_labels, image_paths = load_landuse_images(args.base_path, args.folder, args.classes, IMG_SIZE)
+    images, string_labels, image_paths = load_landuse_images(
+        args.base_path,
+        args.folder,
+        args.classes,
+        args.img_size,
+        args.max_images_per_class,
+    )
 
     label_binarizer = LabelBinarizer()
     y_onehot = label_binarizer.fit_transform(string_labels)
@@ -435,6 +571,11 @@ def main():
     print("\nDistribucion:")
     print(f"Entrenamiento: {train_x.shape}, Prueba: {test_x.shape}")
     print(f"Clases: {class_names}")
+    print(
+        "Configuracion deep learning: "
+        f"modelos={args.deep_models}, epochs={args.epochs}, batch_size={args.batch_size}, "
+        f"img_size={args.img_size}, model_scale={args.model_scale}, augment={args.augment}"
+    )
 
     # 1) Modelo clasico de ML del notebook LandUseML.ipynb
     label_encoder = LabelEncoder()
@@ -452,47 +593,67 @@ def main():
     # 2) CNN secuencial mejorada
     input_shape = train_x.shape[1:]
     num_classes = len(class_names)
-    sequential_model = build_sequential_cnn(input_shape, num_classes)
-    sequential_model, _ = compile_and_train(
-        sequential_model,
-        train_x,
-        train_y,
-        test_x,
-        test_y,
-        dirs,
-        "02_cnn_secuencial_mejorada",
-        args.epochs,
-        args.batch_size,
-    )
-    seq_probs, seq_metrics = evaluate_keras_model(sequential_model, test_x, test_y, class_names, "02_cnn_secuencial_mejorada", dirs)
+    metrics_list = [ml_metrics]
+    probs_by_model = {}
+
+    if "cnn" in args.deep_models:
+        sequential_model = build_sequential_cnn(input_shape, num_classes, args.model_scale)
+        sequential_model, _ = compile_and_train(
+            sequential_model,
+            train_x,
+            train_y,
+            test_x,
+            test_y,
+            dirs,
+            "02_cnn_secuencial_mejorada",
+            args.epochs,
+            args.batch_size,
+            args.augment,
+            args.early_stop_patience,
+            args.lr_patience,
+        )
+        seq_probs, seq_metrics = evaluate_keras_model(
+            sequential_model,
+            test_x,
+            test_y,
+            class_names,
+            "02_cnn_secuencial_mejorada",
+            dirs,
+        )
+        metrics_list.append(seq_metrics)
+        probs_by_model["CNN"] = seq_probs
 
     # 3) Arquitectura no secuencial tipo ResNet
-    resnet_model = build_resnet_like(input_shape, num_classes)
-    resnet_model, _ = compile_and_train(
-        resnet_model,
-        train_x,
-        train_y,
-        test_x,
-        test_y,
-        dirs,
-        "03_resnet_ligera_no_secuencial",
-        args.epochs,
-        args.batch_size,
-    )
-    res_probs, res_metrics = evaluate_keras_model(resnet_model, test_x, test_y, class_names, "03_resnet_ligera_no_secuencial", dirs)
+    if "resnet" in args.deep_models:
+        resnet_model = build_resnet_like(input_shape, num_classes, args.model_scale)
+        resnet_model, _ = compile_and_train(
+            resnet_model,
+            train_x,
+            train_y,
+            test_x,
+            test_y,
+            dirs,
+            "03_resnet_ligera_no_secuencial",
+            args.epochs,
+            args.batch_size,
+            args.augment,
+            args.early_stop_patience,
+            args.lr_patience,
+        )
+        res_probs, res_metrics = evaluate_keras_model(
+            resnet_model,
+            test_x,
+            test_y,
+            class_names,
+            "03_resnet_ligera_no_secuencial",
+            dirs,
+        )
+        metrics_list.append(res_metrics)
+        probs_by_model["ResNet"] = res_probs
 
-    metrics_list = [ml_metrics, seq_metrics, res_metrics]
     plot_metrics_comparison(metrics_list, dirs)
-    save_prediction_examples(
-        test_x,
-        test_y,
-        {
-            "CNN": seq_probs,
-            "ResNet": res_probs,
-        },
-        class_names,
-        dirs,
-    )
+    if probs_by_model:
+        save_prediction_examples(test_x, test_y, probs_by_model, class_names, dirs)
     write_conclusions(metrics_list, dirs, args.classes)
 
     print("\nProceso terminado.")

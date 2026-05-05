@@ -23,6 +23,8 @@ Mas rapido para pruebas:
 python reto_landuse_rapido_y_preciso.py --base-path "TU_RUTA" --folder landuse --epochs-cnn 5 --epochs-transfer 5 --fine-tune-epochs 2 --img-size 128 --max-images-per-class 120
 """
 
+### Correr asi: python reto_landuse_deep_learning.py --base-path "." --folder landuse 
+
 import argparse
 import json
 import os

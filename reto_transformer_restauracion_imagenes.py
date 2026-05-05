@@ -33,6 +33,8 @@ Notas:
   Matplotlib para evidencia, metricas numericas y rutas configurables.
 """
 
+### Correr asi: python reto_transformer_restauracion_imagenes.py --gt_dir img/ --output_dir .\resultados_swinir --generate_defects --max_images 3   
+
 from __future__ import annotations
 
 import argparse

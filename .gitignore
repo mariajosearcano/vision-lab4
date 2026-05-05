@@ -2,3 +2,6 @@ venv/
 landuse/
 __pycache__/
 evidencias_landuse/
+resultados_swinir/
+img/
+SwinIR/
